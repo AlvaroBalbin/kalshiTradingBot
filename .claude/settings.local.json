@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(find /c/Users/alvar/github-repos/tradingBotKalshi -type f -name *.py -o -name *.ts -o -name *.js -o -name *.toml -o -name *.txt -o -name *.cfg)",
+      "Bash(pip list:*)",
+      "Bash(pip show:*)",
+      "Bash(for d:*)",
+      "Bash(do touch:*)",
+      "Bash(python -m venv .venv)",
+      "Bash(.venv/Scripts/activate)",
+      "Bash(pip install:*)",
+      "Bash(python scripts/check_setup.py)",
+      "Bash(python -c \":*)",
+      "Bash(python -m py_compile scripts/run_bot.py)",
+      "Bash(find /c/Users/alvar/github-repos/tradingBotKalshi -maxdepth 2 -not -path */.venv* -type d)",
+      "Bash(.venv/Scripts/python -m pytest tests/test_strategy.py -v)",
+      "Bash(.venv/Scripts/python scripts/paper_test.py)",
+      "Bash(.venv/Scripts/pip install:*)"
+    ]
+  }
+}

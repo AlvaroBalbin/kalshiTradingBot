@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "kalshi-fomc-bot"
+version = "0.1.0"
+description = "FOMC rate decision trading bot for Kalshi prediction markets"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "websockets>=12.0",
+    "cryptography>=42.0",
+    "pydantic-settings>=2.0",
+    "fredapi>=0.5",
+    "yfinance>=0.2",
+    "apscheduler>=3.10",
+    "aiosqlite>=0.19",
+    "structlog>=24.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+run-bot = "scripts.run_bot:main"
+check-setup = "scripts.check_setup:main"
