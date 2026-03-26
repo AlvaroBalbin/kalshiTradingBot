@@ -37,7 +37,7 @@ async def decide_trades(signals: list[AggregatedSignal],
         return []
 
     # Pre-trade checks (no orderbook yet — we'll check per-market)
-    ok, reasons = await pre_trade_checks()
+    ok, reasons = await pre_trade_checks(kalshi=kalshi)
     if not ok:
         log.warning("trades_blocked_by_risk", reasons=reasons)
         return []
@@ -77,7 +77,7 @@ async def decide_trades(signals: list[AggregatedSignal],
             continue
 
         # Per-market liquidity check
-        ok, reasons = await pre_trade_checks(orderbook)
+        ok, reasons = await pre_trade_checks(kalshi=kalshi, orderbook=orderbook)
         if not ok:
             continue
 

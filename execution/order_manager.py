@@ -1,6 +1,7 @@
 """Order execution — places and tracks orders on Kalshi, or simulates in paper mode."""
 
 import asyncio
+from pathlib import Path
 
 import structlog
 
@@ -8,6 +9,7 @@ from config.settings import settings
 from data.kalshi_client import KalshiClient
 from strategy.trade_decision import TradeOrder
 from db.database import insert_signal, insert_trade, update_trade_status
+from monitoring.alerts import alert_error
 
 log = structlog.get_logger()
 
@@ -74,6 +76,11 @@ async def execute_order(kalshi: KalshiClient, order: TradeOrder) -> dict | None:
             )
     except Exception as e:
         log.error("order_placement_failed", ticker=order.market_ticker, error=str(e))
+        alert_error("order_placement", f"{order.market_ticker}: {e}")
+        # Auto-kill on auth failures (401/403) to prevent repeated failures
+        if "401" in str(e) or "403" in str(e):
+            Path(settings.kill_switch_path).touch()
+            log.error("auth_failure_kill_switch_activated")
         return None
 
     order_id = result.get("order_id", "")

@@ -88,16 +88,16 @@ async def main():
     except Exception as e:
         all_ok &= check("SQLite Database", False, str(e))
 
-    # 8. FOMC Calendar
-    from config.fomc_calendar import get_next_fomc_date, days_to_next_fomc
-    next_fomc = get_next_fomc_date()
-    days = days_to_next_fomc()
-    check("FOMC Calendar", next_fomc is not None,
-          f"Next meeting: {next_fomc} ({days} days)" if next_fomc else "No upcoming meetings in calendar")
+    # 8. Economic Calendar
+    from config.economic_calendar import get_upcoming_events, get_next_event
+    upcoming = get_upcoming_events(within_days=14)
+    next_ev = get_next_event()
+    check("Economic Calendar", len(upcoming) > 0,
+          f"{len(upcoming)} events in 14 days, next: {next_ev.name} ({next_ev.date})" if next_ev else "No upcoming events")
 
-    # 9. Demo mode
-    check("Demo Mode", settings.use_demo,
-          "ON — safe for testing" if settings.use_demo else "OFF — REAL MONEY MODE")
+    # 9. Trading mode
+    check("Trading Mode", True,
+          f"{settings.trading_mode.upper()} — {'no real orders' if not settings.is_live else 'LIVE TRADING'}")
 
     print(f"\n{'All checks passed!' if all_ok else 'Some checks failed — fix issues above.'}\n")
     return 0 if all_ok else 1

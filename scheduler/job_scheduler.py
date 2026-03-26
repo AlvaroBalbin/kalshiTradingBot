@@ -1,17 +1,19 @@
-"""FOMC-aware job scheduler — ramps up polling frequency near meetings."""
+"""Economic event-aware job scheduler — ramps up polling near any tracked release."""
 
 import asyncio
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
 import structlog
 
 from config.settings import settings
-from config.fomc_calendar import (
-    is_fomc_week, is_fomc_day, is_in_blackout,
-    days_to_next_fomc, get_next_fomc_date, ET,
+from config.economic_calendar import (
+    ET, get_upcoming_events, is_event_day, is_in_any_blackout,
+    days_to_next_event, get_next_event,
 )
 from data.kalshi_client import KalshiClient
 from signals.signal_aggregator import generate_signals
@@ -22,7 +24,8 @@ from monitoring.pnl_tracker import get_portfolio_summary
 from db.database import insert_price_snapshot
 from monitoring.alerts import (
     alert_signal_found, alert_trade_executed, alert_circuit_breaker,
-    alert_fomc_approaching, alert_error,
+    alert_event_approaching, alert_error, alert_kill_switch,
+    alert_daily_summary,
 )
 
 log = structlog.get_logger()
@@ -36,6 +39,11 @@ def _run_async(coro_func):
     return wrapper
 
 
+def _check_kill_switch() -> bool:
+    """Returns True if kill switch is active."""
+    return Path(settings.kill_switch_path).exists()
+
+
 class BotScheduler:
     def __init__(self, kalshi: KalshiClient):
         self.kalshi = kalshi
@@ -44,8 +52,10 @@ class BotScheduler:
         self._running = False
 
     def start(self):
-        """Start the scheduler with FOMC-aware intervals."""
+        """Start the scheduler with event-aware intervals."""
         self._update_interval()
+
+        # Frequency adjuster: checks every minute if we need to change polling speed
         self.scheduler.add_job(
             _run_async(self._adjust_frequency),
             IntervalTrigger(minutes=1),
@@ -54,31 +64,47 @@ class BotScheduler:
             misfire_grace_time=30,
             coalesce=True,
         )
+
+        # Daily summary at 6 PM ET
+        self.scheduler.add_job(
+            _run_async(self._daily_summary),
+            CronTrigger(hour=18, minute=0, timezone=ET),
+            id="daily_summary",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+
         self.scheduler.start()
-        log.info("scheduler_started", interval=self._current_interval)
+        log.info("scheduler_started", interval=self._current_interval,
+                 mode=settings.trading_mode)
 
     def stop(self):
         self.scheduler.shutdown(wait=False)
         log.info("scheduler_stopped")
 
     def _get_optimal_interval(self) -> int:
-        """Determine polling interval based on proximity to FOMC."""
+        """Determine polling interval based on proximity to ANY economic event."""
         now = datetime.now(ET)
 
-        if is_in_blackout(now):
+        # Check blackout for any event
+        blacked, reason = is_in_any_blackout(now)
+        if blacked:
             return 0
 
-        if is_fomc_day(now.date()):
-            if now.hour < 14:
+        # Check if today is any event day
+        todays_events = is_event_day(now.date())
+        if todays_events:
+            return settings.poll_interval_fomc_day  # 30 sec on event days
+
+        # Check proximity to next event of any type
+        days = days_to_next_event()
+        if days is not None:
+            if days <= 1:
                 return settings.poll_interval_fomc_day
-            elif now.hour == 14 and now.minute < 55:
-                return settings.poll_interval_fomc_day
-            elif now.hour >= 14 and now.minute >= 15:
-                return 60
-            else:
-                return 0
-        if is_fomc_week(now.date()):
-            return settings.poll_interval_fomc_week
+            elif days <= 7:
+                return settings.poll_interval_fomc_week
+            elif days <= 14:
+                return settings.poll_interval_fomc_week * 2  # 10 min
 
         return settings.poll_interval_normal
 
@@ -112,20 +138,31 @@ class BotScheduler:
         """Check if we need to change polling frequency."""
         self._update_interval()
 
-        days = days_to_next_fomc()
-        if days is not None and days <= 7:
-            next_date = get_next_fomc_date()
-            alert_fomc_approaching(days, str(next_date))
+        # Alert about upcoming events within 7 days
+        upcoming = get_upcoming_events(within_days=7)
+        for event in upcoming:
+            days = (event.date - datetime.now(ET).date()).days
+            if days <= 3:
+                alert_event_approaching(event.name, days, str(event.date))
 
     async def _main_loop(self):
         """Main trading loop — fetch data, generate signals, execute trades."""
+        # Kill switch check FIRST
+        if _check_kill_switch():
+            log.warning("kill_switch_active")
+            alert_kill_switch()
+            return
+
         if self._running:
             log.debug("main_loop_already_running")
             return
         self._running = True
 
         try:
-            log.info("main_loop_tick")
+            log.info("main_loop_tick", mode=settings.trading_mode)
+
+            # Get upcoming events to process
+            upcoming = get_upcoming_events(within_days=7)
 
             # 0. Check exits on existing positions first
             exits = await check_exits(self.kalshi)
@@ -134,10 +171,10 @@ class BotScheduler:
                     log.info("position_exit", ticker=ex["ticker"],
                              action=ex["action"], pnl=round(ex.get("pnl", 0), 2))
 
-            # 1. Generate signals
-            signals = await generate_signals(self.kalshi)
+            # 1. Generate signals for all upcoming events
+            signals = await generate_signals(self.kalshi, upcoming if upcoming else None)
 
-            # Track price history for all signals (even if we don't trade)
+            # Track price history for all signals
             for s in (signals or []):
                 try:
                     await insert_price_snapshot(
@@ -174,6 +211,7 @@ class BotScheduler:
                     alert_trade_executed(
                         order.market_ticker, order.side,
                         order.count, order.price,
+                        edge=order.signal.edge_estimate,
                     )
 
             # 4. Portfolio summary
@@ -184,3 +222,19 @@ class BotScheduler:
             log.exception("main_loop_error")
         finally:
             self._running = False
+
+    async def _daily_summary(self):
+        """Send daily P&L summary via Telegram."""
+        try:
+            summary = await get_portfolio_summary(self.kalshi)
+
+            # Add upcoming events info
+            upcoming = get_upcoming_events(within_days=7)
+            summary["upcoming_events"] = [
+                {"name": e.name, "date": str(e.date), "type": e.event_type}
+                for e in upcoming
+            ]
+
+            await alert_daily_summary(summary)
+        except Exception as e:
+            log.error("daily_summary_failed", error=str(e))

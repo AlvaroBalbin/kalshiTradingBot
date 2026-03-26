@@ -11,3 +11,6 @@ build/
 *.db
 *.sqlite
 .pytest_cache/
+SUMMARY.md
+KILL_SWITCH
+.live_confirmed

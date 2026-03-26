@@ -149,39 +149,63 @@ class KalshiClient:
         data = await self._request("GET", "/portfolio/fills", params=params)
         return data.get("fills", [])
 
-    # --- Fed Market Discovery ---
+    # --- Market Discovery ---
 
     async def get_fed_markets(self) -> list[dict]:
-        """Get all open Fed/FOMC rate decision markets.
+        """Get all open Fed/FOMC rate decision markets (backward compat)."""
+        return await self.get_economic_markets("fomc", "KXFED")
 
-        Strategy:
-        1. Try getting events for KXFED series
-        2. For each event, get all sub-markets (rate brackets)
-        3. Fall back to direct market search if events API fails
+    async def get_economic_markets(self, event_type: str,
+                                   series_prefix: str) -> list[dict]:
+        """Get all open markets for an economic event type.
+
+        Uses multi-fallback discovery:
+        1. Event-based (series ticker → events → sub-markets)
+        2. Direct series search
+        3. Keyword search in market titles
         """
+        # Alternate series tickers to try per event type
+        alt_series = {
+            "fomc": ["KXFED", "FED"],
+            "cpi": ["KXCPI", "CPI", "KXINFLATION"],
+            "nfp": ["KXNFP", "NFP", "KXJOBS", "KXPAYROLLS"],
+            "claims": ["KXINITCLAIMS", "KXUNEMPLOY", "KXJOBLESS"],
+            "gdp": ["KXGDP", "GDP"],
+        }
+
+        series_list = alt_series.get(event_type, [series_prefix])
+        if series_prefix not in series_list:
+            series_list.insert(0, series_prefix)
+
         markets = []
 
-        # Method 1: Event-based discovery (most reliable)
-        try:
-            events = await self.get_events(series_ticker="KXFED")
-            for event in events:
-                event_ticker = event.get("event_ticker", "")
-                if event_ticker:
-                    event_markets = await self.get_markets(event_ticker=event_ticker)
-                    markets.extend(event_markets)
-                    log.info("fed_event_found", event_ticker=event_ticker,
-                             num_markets=len(event_markets))
-        except httpx.HTTPStatusError as e:
-            log.warning("fed_events_fetch_failed", error=str(e))
+        # Method 1: Event-based discovery
+        for series in series_list:
+            try:
+                events = await self.get_events(series_ticker=series)
+                for event in events:
+                    event_ticker = event.get("event_ticker", "")
+                    if event_ticker:
+                        event_markets = await self.get_markets(event_ticker=event_ticker)
+                        markets.extend(event_markets)
+                        log.info("event_found", event_type=event_type,
+                                 event_ticker=event_ticker,
+                                 num_markets=len(event_markets))
+            except httpx.HTTPStatusError:
+                continue
+            if markets:
+                break
 
         # Method 2: Direct series search (fallback)
         if not markets:
-            for series in ["KXFED", "FED"]:
+            for series in series_list:
                 try:
                     m = await self.get_markets(series_ticker=series)
                     markets.extend(m)
                 except httpx.HTTPStatusError:
                     continue
+                if markets:
+                    break
 
         # Deduplicate by ticker
         seen = set()
@@ -192,7 +216,7 @@ class KalshiClient:
                 seen.add(ticker)
                 unique.append(m)
 
-        log.info("fed_markets_discovered", count=len(unique),
+        log.info("markets_discovered", event_type=event_type, count=len(unique),
                  tickers=[m.get("ticker", "") for m in unique[:10]])
         return unique
 

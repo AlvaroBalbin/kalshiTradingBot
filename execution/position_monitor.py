@@ -5,6 +5,7 @@ import structlog
 from config.settings import settings
 from data.kalshi_client import KalshiClient
 from db.database import get_open_positions, update_trade_status
+from monitoring.alerts import alert_exit, alert_error
 
 log = structlog.get_logger()
 
@@ -62,6 +63,7 @@ async def check_exits(kalshi: KalshiClient) -> list[dict]:
                                       pnl=net_pnl, fees=fees)
             log.info("position_settled", ticker=ticker, side=side,
                      pnl=round(net_pnl, 2), result=result_str)
+            alert_exit(ticker, f"settled ({result_str})", net_pnl)
             exits.append({"ticker": ticker, "action": "settled",
                           "pnl": net_pnl, "result": result_str})
             continue
@@ -128,6 +130,7 @@ async def _exit_position(kalshi: KalshiClient, trade: dict,
         action = "profit_target" if pnl_per > 0 else "stop_loss"
         log.info("PAPER_EXIT", ticker=ticker, side=side,
                  action=action, pnl=round(net_pnl, 2))
+        alert_exit(ticker, f"paper_{action}", net_pnl)
         return {"ticker": ticker, "action": action, "pnl": net_pnl}
 
     # Real exit: sell the position
@@ -157,8 +160,10 @@ async def _exit_position(kalshi: KalshiClient, trade: dict,
         log.info("EXIT_EXECUTED", ticker=ticker, side=side,
                  action=action, pnl=round(net_pnl, 2),
                  order_id=result.get("order_id", ""))
+        alert_exit(ticker, action, net_pnl)
         return {"ticker": ticker, "action": action, "pnl": net_pnl}
 
     except Exception as e:
         log.error("exit_failed", ticker=ticker, error=str(e))
+        alert_error("exit_position", f"{ticker}: {e}")
         return None

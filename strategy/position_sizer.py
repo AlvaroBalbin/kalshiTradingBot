@@ -5,21 +5,21 @@ import math
 import structlog
 
 from config.settings import settings
-from config.fomc_calendar import days_to_next_fomc
+from config.economic_calendar import days_to_next_event
 
 log = structlog.get_logger()
 
 
 def _time_decay_multiplier() -> float:
-    """Scale position size based on days until FOMC.
+    """Scale position size based on days until next economic event.
 
-    Far from FOMC (>14 days): spreads wider, more opportunity → 1.0x
-    FOMC week (1-7 days): spreads narrowing, moderate → 0.7x
-    FOMC day (0 days): volatile, conservative → 0.4x
+    Far from event (>14 days): spreads wider, more opportunity → 1.0x
+    Event week (1-7 days): spreads narrowing, moderate → 0.7x
+    Event day (0 days): volatile, conservative → 0.4x
     """
-    days = days_to_next_fomc()
+    days = days_to_next_event()
     if days is None:
-        return 0.5  # No upcoming FOMC, be cautious
+        return 0.5  # No upcoming events, be cautious
 
     if days == 0:
         return 0.4
@@ -73,11 +73,11 @@ def kelly_size(edge: float, price: float, bankroll: float) -> int:
     dollar_amount = adjusted_f * bankroll
     contracts = int(dollar_amount / price)
 
-    # Apply caps
-    contracts = min(contracts, settings.max_position_per_market)
+    # Apply tier-aware caps
+    contracts = min(contracts, settings.effective_max_position_per_market)
 
     # Ensure we don't exceed total exposure
-    max_by_exposure = int(settings.max_portfolio_exposure / price)
+    max_by_exposure = int(settings.effective_max_portfolio_exposure / price)
     contracts = min(contracts, max_by_exposure)
 
     # Minimum 1 contract if we have any signal

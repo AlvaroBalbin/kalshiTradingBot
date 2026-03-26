@@ -5,7 +5,7 @@ from datetime import date, timedelta
 import yfinance as yf
 import structlog
 
-from config.fomc_calendar import FOMC_MEETINGS_2026, get_next_fomc_date
+from config.economic_calendar import FOMC_DATES_2026 as FOMC_MEETINGS_2026, get_next_fomc_date
 
 log = structlog.get_logger()
 

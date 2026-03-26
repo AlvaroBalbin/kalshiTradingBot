@@ -1,12 +1,17 @@
-"""Core alpha signal: FedWatch vs Kalshi probability spread.
+"""Core alpha signal: consensus probability vs Kalshi market price spread.
 
-Kalshi Fed markets are binary "above X%" contracts:
-- KXFED-26APR-T4.25 = "Will the fed funds upper bound be above 4.25%?"
-- YES price = cumulative probability that rate >= the threshold
+Works for ALL economic event types:
+- FOMC: FedWatch cumulative probs vs KXFED "above X%" contracts
+- CPI: Cleveland Fed Nowcast → probability distribution vs KXCPI contracts
+- NFP: FRED payroll trend → probability distribution vs KXNFP contracts
+- Claims: FRED claims trend → probability distribution vs KXINITCLAIMS contracts
+- GDP: Atlanta Fed GDPNow → probability distribution vs KXGDP contracts
 
-FedWatch gives us probabilities for specific rate ranges (e.g., 3.75-4.00 = 70%).
-We convert FedWatch range probabilities to cumulative "above X%" probabilities
-to compare against Kalshi prices.
+The pattern is always the same:
+1. Get consensus estimate for the indicator
+2. Convert to a probability for each Kalshi threshold
+3. Compare consensus probability against Kalshi market price
+4. If spread > threshold, generate a signal
 """
 
 import re
@@ -16,9 +21,11 @@ from datetime import datetime
 import structlog
 
 from config.settings import settings
-from config.fomc_calendar import get_next_fomc_date, FOMC_MEETINGS_2026
+from config.economic_calendar import EconomicEvent, get_next_fomc_date, FOMC_DATES_2026
 from data.kalshi_client import KalshiClient
-from data.fedwatch import compute_fedwatch_probabilities, rate_range_to_bps
+from data.consensus_client import (
+    get_consensus, consensus_to_probability, ConsensusEstimate,
+)
 
 log = structlog.get_logger()
 
@@ -26,14 +33,20 @@ log = structlog.get_logger()
 @dataclass
 class SpreadSignal:
     market_ticker: str
-    direction: str  # "BUY_YES" or "BUY_NO"
+    event_type: str     # "fomc", "cpi", "nfp", "claims", "gdp"
+    direction: str      # "BUY_YES" or "BUY_NO"
     kalshi_yes_price: float  # 0-1
-    fedwatch_prob: float  # 0-1 (cumulative above threshold)
+    consensus_prob: float    # 0-1 (probability above threshold)
     raw_spread: float
     edge_after_fees: float
-    threshold_rate: float  # The "above X%" threshold
-    rate_range: str  # e.g., "4.25-4.50"
+    threshold: float    # The "above X" threshold value
+    rate_range: str     # e.g., "4.25-4.50" or ">220K"
     timestamp: datetime
+
+    # Backward compat alias
+    @property
+    def fedwatch_prob(self) -> float:
+        return self.consensus_prob
 
 
 def _kalshi_fee(buy_price: float) -> float:
@@ -42,36 +55,34 @@ def _kalshi_fee(buy_price: float) -> float:
 
 
 def _extract_threshold(ticker: str) -> float | None:
-    """Extract the rate threshold from a Kalshi ticker.
+    """Extract numeric threshold from a Kalshi ticker.
 
     KXFED-26APR-T4.25 → 4.25
-    KXFED-26APR-T3.75 → 3.75
+    KXCPI-26MAR-T3.0 → 3.0
+    KXNFP-26MAR-T200 → 200
     """
-    match = re.search(r'T(\d+\.\d+)', ticker)
+    match = re.search(r'T(\d+\.?\d*)', ticker)
+    if match:
+        return float(match.group(1))
+    # Try B prefix (below)
+    match = re.search(r'B(\d+\.?\d*)', ticker)
     if match:
         return float(match.group(1))
     return None
 
 
-def _fedwatch_to_cumulative(fedwatch_probs: dict[str, float]) -> dict[float, float]:
-    """Convert FedWatch range probabilities to cumulative "above X%" probabilities.
+# --- FOMC-specific logic (existing, preserved) ---
 
-    If FedWatch says:
-      3.50-3.75: 10%, 3.75-4.00: 70%, 4.00-4.25: 15%, 4.25-4.50: 5%
-    Then cumulative "above" probabilities are:
-      above 3.50: 100% (all outcomes are >= 3.50)
-      above 3.75: 90% (everything except 3.50-3.75)
-      above 4.00: 20% (4.00-4.25 + 4.25-4.50)
-      above 4.25: 5% (just 4.25-4.50)
-    """
-    # Parse ranges and sort by lower bound
+def _fedwatch_to_cumulative(fedwatch_probs: dict[str, float]) -> dict[float, float]:
+    """Convert FedWatch range probabilities to cumulative "above X%" probabilities."""
+    from data.fedwatch import rate_range_to_bps
+
     parsed = []
     for range_str, prob in fedwatch_probs.items():
         low_bps, high_bps = rate_range_to_bps(range_str)
         parsed.append((low_bps / 100, high_bps / 100, prob))
     parsed.sort(key=lambda x: x[0])
 
-    # Build cumulative from top
     cumulative = {}
     running = 0.0
     for low, high, prob in reversed(parsed):
@@ -82,10 +93,6 @@ def _fedwatch_to_cumulative(fedwatch_probs: dict[str, float]) -> dict[float, flo
 
 
 def _get_meeting_event_ticker(meeting_date) -> str:
-    """Build the Kalshi event ticker for a meeting date.
-
-    April 29, 2026 → KXFED-26APR
-    """
     month_abbrevs = {
         1: "JAN", 2: "FEB", 3: "MAR", 4: "APR", 5: "MAY", 6: "JUN",
         7: "JUL", 8: "AUG", 9: "SEP", 10: "OCT", 11: "NOV", 12: "DEC",
@@ -95,27 +102,22 @@ def _get_meeting_event_ticker(meeting_date) -> str:
     return f"KXFED-{yr}{mon}"
 
 
-async def compute_spread_signals(kalshi: KalshiClient) -> list[SpreadSignal]:
-    """Compute probability spread signals for Fed markets.
+async def _compute_fomc_spread_signals(kalshi: KalshiClient) -> list[SpreadSignal]:
+    """Original FOMC spread signal logic using FedWatch."""
+    from data.fedwatch import compute_fedwatch_probabilities
 
-    Compares FedWatch cumulative probabilities against Kalshi "above X%" prices.
-    """
     next_meeting = get_next_fomc_date()
     if next_meeting is None:
-        log.info("no_upcoming_fomc_meeting")
         return []
 
-    # Get FedWatch probabilities
     fedwatch_probs = compute_fedwatch_probabilities(next_meeting)
     if not fedwatch_probs:
         log.warning("no_fedwatch_probabilities")
         return []
 
-    # Convert to cumulative "above" probabilities
     cumulative = _fedwatch_to_cumulative(fedwatch_probs)
     log.info("fedwatch_cumulative", probs=cumulative)
 
-    # Get Kalshi markets for this meeting
     event_ticker = _get_meeting_event_ticker(next_meeting)
     try:
         markets = await kalshi.get_markets(event_ticker=event_ticker)
@@ -124,57 +126,110 @@ async def compute_spread_signals(kalshi: KalshiClient) -> list[SpreadSignal]:
         return []
 
     if not markets:
-        log.warning("no_kalshi_markets", event_ticker=event_ticker)
         return []
 
+    return _compute_signals_from_markets(
+        markets=markets,
+        prob_lookup=cumulative,
+        event_type="fomc",
+    )
+
+
+# --- Generic logic for non-FOMC events ---
+
+async def _compute_generic_spread_signals(
+    kalshi: KalshiClient,
+    event: EconomicEvent,
+) -> list[SpreadSignal]:
+    """Compute spread signals for CPI, NFP, Claims, GDP using consensus estimates."""
+    consensus = await get_consensus(event.event_type)
+    if consensus is None:
+        log.warning("no_consensus_data", event_type=event.event_type)
+        return []
+
+    # Discover Kalshi markets for this event
+    markets = await kalshi.get_economic_markets(event.event_type, event.series_prefix)
+    if not markets:
+        log.info("no_markets_for_event", event_type=event.event_type, prefix=event.series_prefix)
+        return []
+
+    # Build probability lookup: for each threshold, compute P(above threshold)
+    prob_lookup = {}
+    for market in markets:
+        ticker = market.get("ticker", "")
+        threshold = _extract_threshold(ticker)
+        if threshold is not None:
+            prob = consensus_to_probability(consensus, threshold, above=True)
+            prob_lookup[threshold] = prob
+
+    if not prob_lookup:
+        return []
+
+    log.info("consensus_probabilities",
+             event_type=event.event_type,
+             consensus=consensus.point_estimate,
+             source=consensus.source,
+             thresholds=prob_lookup)
+
+    return _compute_signals_from_markets(
+        markets=markets,
+        prob_lookup=prob_lookup,
+        event_type=event.event_type,
+    )
+
+
+def _compute_signals_from_markets(
+    markets: list[dict],
+    prob_lookup: dict[float, float],
+    event_type: str,
+) -> list[SpreadSignal]:
+    """Generic signal computation: compare probability lookup against Kalshi prices."""
     signals = []
+
     for market in markets:
         ticker = market.get("ticker", "")
         threshold = _extract_threshold(ticker)
         if threshold is None:
             continue
 
-        # Get Kalshi price
         yes_ask = market.get("yes_ask", 0)
         yes_bid = market.get("yes_bid", 0)
 
         if yes_ask <= 0 and yes_bid <= 0:
-            continue  # No liquidity
+            continue
 
-        kalshi_mid = ((yes_bid + yes_ask) / 2) / 100 if (yes_bid > 0 and yes_ask > 0) else max(yes_ask, yes_bid) / 100
+        if yes_bid > 0 and yes_ask > 0:
+            kalshi_mid = (yes_bid + yes_ask) / 2 / 100
+        else:
+            kalshi_mid = max(yes_ask, yes_bid) / 100
 
         if kalshi_mid <= 0:
             continue
 
-        # Find matching FedWatch cumulative probability
-        fw_prob = cumulative.get(threshold)
-        if fw_prob is None:
-            # Find closest threshold
-            closest = min(cumulative.keys(), key=lambda x: abs(x - threshold), default=None)
-            if closest is not None and abs(closest - threshold) <= 0.25:
-                fw_prob = cumulative[closest]
+        # Find matching probability
+        prob = prob_lookup.get(threshold)
+        if prob is None:
+            closest = min(prob_lookup.keys(), key=lambda x: abs(x - threshold), default=None)
+            if closest is not None and abs(closest - threshold) <= _threshold_tolerance(event_type):
+                prob = prob_lookup[closest]
             else:
                 continue
 
-        # Calculate spread
-        raw_spread = fw_prob - kalshi_mid
+        raw_spread = prob - kalshi_mid
 
         if abs(raw_spread) < settings.probability_threshold:
             continue
 
-        # Determine direction and edge
         if raw_spread > 0:
-            # Kalshi underpriced → BUY YES
             buy_price = yes_ask / 100 if yes_ask > 0 else kalshi_mid
             fee = _kalshi_fee(buy_price)
-            edge = fw_prob - buy_price - fee
+            edge = prob - buy_price - fee
             direction = "BUY_YES"
         else:
-            # Kalshi overpriced → BUY NO
             no_ask = market.get("no_ask", 0)
             buy_price = no_ask / 100 if no_ask > 0 else (1 - kalshi_mid)
             fee = _kalshi_fee(buy_price)
-            edge = (1 - fw_prob) - buy_price - fee
+            edge = (1 - prob) - buy_price - fee
             direction = "BUY_NO"
 
         if edge < settings.min_edge_after_fees:
@@ -182,20 +237,74 @@ async def compute_spread_signals(kalshi: KalshiClient) -> list[SpreadSignal]:
 
         signal = SpreadSignal(
             market_ticker=ticker,
+            event_type=event_type,
             direction=direction,
             kalshi_yes_price=kalshi_mid,
-            fedwatch_prob=fw_prob,
+            consensus_prob=prob,
             raw_spread=abs(raw_spread),
             edge_after_fees=edge,
-            threshold_rate=threshold,
-            rate_range=f"{threshold:.2f}-{threshold + 0.25:.2f}",
+            threshold=threshold,
+            rate_range=_format_range(event_type, threshold),
             timestamp=datetime.utcnow(),
         )
         signals.append(signal)
         log.info("spread_signal",
-                 ticker=ticker, direction=direction,
+                 ticker=ticker, event_type=event_type, direction=direction,
                  threshold=threshold,
-                 kalshi=round(kalshi_mid, 3), fedwatch=round(fw_prob, 3),
+                 kalshi=round(kalshi_mid, 3), consensus=round(prob, 3),
                  spread=round(abs(raw_spread), 3), edge=round(edge, 3))
 
     return signals
+
+
+def _threshold_tolerance(event_type: str) -> float:
+    """How close a threshold must be to match (event-type dependent)."""
+    return {
+        "fomc": 0.25,     # 25bps rate buckets
+        "cpi": 0.2,       # 0.2% CPI buckets
+        "nfp": 25.0,      # 25K jobs buckets
+        "claims": 10.0,   # 10K claims buckets
+        "gdp": 0.5,       # 0.5% GDP buckets
+    }.get(event_type, 0.25)
+
+
+def _format_range(event_type: str, threshold: float) -> str:
+    """Format a human-readable range string."""
+    if event_type == "fomc":
+        return f"{threshold:.2f}-{threshold + 0.25:.2f}"
+    elif event_type in ("cpi", "gdp"):
+        return f">{threshold:.1f}%"
+    elif event_type in ("nfp", "claims"):
+        return f">{threshold:.0f}K"
+    return f">{threshold}"
+
+
+# --- Public API ---
+
+async def compute_spread_signals(
+    kalshi: KalshiClient,
+    events: list[EconomicEvent] | None = None,
+) -> list[SpreadSignal]:
+    """Compute spread signals for all active economic events.
+
+    If events is None, computes FOMC signals only (backward compatible).
+    If events is provided, computes signals for each event type.
+    """
+    all_signals = []
+
+    if events is None:
+        # Backward compatible: FOMC only
+        return await _compute_fomc_spread_signals(kalshi)
+
+    for event in events:
+        try:
+            if event.event_type == "fomc":
+                signals = await _compute_fomc_spread_signals(kalshi)
+            else:
+                signals = await _compute_generic_spread_signals(kalshi, event)
+            all_signals.extend(signals)
+        except Exception as e:
+            log.error("spread_signal_error",
+                      event_type=event.event_type, error=str(e))
+
+    return all_signals
