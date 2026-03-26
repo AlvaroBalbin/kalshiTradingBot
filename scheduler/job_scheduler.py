@@ -32,10 +32,17 @@ log = structlog.get_logger()
 
 
 def _run_async(coro_func):
-    """Wrap an async method so APScheduler 3.x can call it."""
+    """Wrap an async method so APScheduler 3.x can call it from any thread."""
     def wrapper(*args, **kwargs):
-        loop = asyncio.get_event_loop()
-        return loop.create_task(coro_func(*args, **kwargs))
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            return loop.create_task(coro_func(*args, **kwargs))
+        else:
+            return asyncio.run(coro_func(*args, **kwargs))
     return wrapper
 
 
