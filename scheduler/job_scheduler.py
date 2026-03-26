@@ -31,21 +31,6 @@ from monitoring.alerts import (
 log = structlog.get_logger()
 
 
-def _run_async(coro_func):
-    """Wrap an async method so APScheduler 3.x can call it from any thread."""
-    def wrapper(*args, **kwargs):
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-
-        if loop and loop.is_running():
-            return loop.create_task(coro_func(*args, **kwargs))
-        else:
-            return asyncio.run(coro_func(*args, **kwargs))
-    return wrapper
-
-
 def _check_kill_switch() -> bool:
     """Returns True if kill switch is active."""
     return Path(settings.kill_switch_path).exists()
@@ -64,7 +49,7 @@ class BotScheduler:
 
         # Frequency adjuster: checks every minute if we need to change polling speed
         self.scheduler.add_job(
-            _run_async(self._adjust_frequency),
+            self._adjust_frequency,
             IntervalTrigger(minutes=1),
             id="frequency_adjuster",
             max_instances=1,
@@ -74,7 +59,7 @@ class BotScheduler:
 
         # Daily summary at 6 PM ET
         self.scheduler.add_job(
-            _run_async(self._daily_summary),
+            self._daily_summary,
             CronTrigger(hour=18, minute=0, timezone=ET),
             id="daily_summary",
             max_instances=1,
@@ -127,7 +112,7 @@ class BotScheduler:
 
         if interval > 0:
             self.scheduler.add_job(
-                _run_async(self._main_loop),
+                self._main_loop,
                 IntervalTrigger(seconds=interval),
                 id="main_loop",
                 replace_existing=True,
